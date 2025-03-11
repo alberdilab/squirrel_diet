@@ -1,0 +1,202 @@
+### Setup sample wildcard:
+import os
+import re
+import pandas as pd
+from glob import glob
+
+SAMPLE = [os.path.basename(fn).replace("_1.fq.gz", "")
+            for fn in glob(f"resources/reads/*_1.fq.gz")]
+
+################################################################################
+### Setup the desired outputs
+rule all:
+    input:
+        "results/taxonomy_counts.tsv"
+
+################################################################################
+### Filter reads with fastp
+rule fastp:
+    input:
+        r1 = "resources/reads/{sample}_1.fq.gz",
+        r2 = "resources/reads/{sample}_2.fq.gz"
+    output:
+        r1 = temp("results/fastp/{sample}_1.fq.gz"),
+        r2 = temp("results/fastp/{sample}_2.fq.gz"),
+        fastp_html = "results/fastp/{sample}.html",
+        fastp_json = "results/fastp/{sample}.json"
+    threads:
+        4
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 5) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 10) * 2 ** (attempt - 1))
+    message:
+        "Using FASTP to trim adapters and low quality sequences for {wildcards.sample}"
+    shell:
+        """
+        module load fastp/0.23.4
+        fastp \
+            --in1 {input.r1} --in2 {input.r2} \
+            --out1 {output.r1} --out2 {output.r2} \
+            --trim_poly_g \
+            --trim_poly_x \
+            --n_base_limit 5 \
+            --qualified_quality_phred 20 \
+            --length_required 60 \
+            --thread {threads} \
+            --html {output.fastp_html} \
+            --json {output.fastp_json} \
+            --adapter_sequence CTGTCTCTTATACACATCT \
+            --adapter_sequence_r2 CTGTCTCTTATACACATCT
+        """
+
+################################################################################
+## Index Unite database:
+rule index_unite:
+    input:
+        "resources/database/sh_general_release_dynamic_s_all_19.02.2025.fasta"
+    output:
+        touch('resources/database/index.done') # Flag file
+    params:
+        database = "resources/database/sh_general_release_dynamic_s_all_19.02.2025"
+    threads:
+        24
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 5) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 5) * 2 ** (attempt - 1))
+    message:
+        "Indexing unite database with Bowtie2"
+    shell:
+        """
+        module load bowtie2/2.4.2
+        # Index MAG gene catalogue
+        bowtie2-build \
+            --large-index \
+            --threads {threads} \
+            {input} {params.database}
+        """
+
+################################################################################
+### Map non-host reads to DRAM genes files using Bowtie2
+rule bowtie2_unite_mapping:
+    input:
+        idx = "resources/database/index.done",
+        r1 = "results/fastp/{sample}_1.fq.gz",
+        r2 = "results/fastp/{sample}_2.fq.gz",
+    output:
+        bam = "results/bowtie/{sample}.bam"
+    params:
+        database = "resources/database/sh_general_release_dynamic_s_all_19.02.2025"
+    threads:
+        20
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 2) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 5) * 2 ** (attempt - 1))
+    message:
+        "Mapping {wildcards.sample} to unite using Bowtie2"
+    shell:
+        """
+        # Map reads to MAGs using Bowtie2
+        module load bowtie2/2.4.2 samtools/1.21
+        bowtie2 \
+            --time \
+            --threads {threads} \
+            -x {params.database} \
+            -1 {input.r1} \
+            -2 {input.r2} \
+            -k 10 \
+            --seed 1337 \
+        | samtools sort -@ {threads} -o {output.bam}
+        """
+
+################################################################################
+### Extract only reads with two or less mismatches + MAPQ>30 (no mismatches)
+rule bowtie2_filtering:
+    input:
+        "results/bowtie/{sample}.bam"
+    output:
+        "results/filter/{sample}.bam"
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 2) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 5) * 2 ** (attempt - 1))
+    message:
+        "Filtering bam file of {wildcards.sample}"
+    shell:
+        """
+        module load samtools/1.21
+        samtools view -h {input} | awk 'substr($0,1,1)=="@" || ($3 != "*" && $0 ~ /NM:i:/ && match($0, /NM:i:([0-9]+)/, arr) && arr[1] <= 2)' | samtools view -b -o {output}
+        """
+
+################################################################################
+### Extract the taxonomy of mapped reads
+rule bowtie2_extracting:
+    input:
+        "results/filter/{sample}.bam"
+    output:
+        "results/extract/{sample}.tsv"
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 2) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 5) * 2 ** (attempt - 1))
+    message:
+        "Filtering bam file of {wildcards.sample}"
+    shell:
+        """
+        module load samtools/1.21
+        samtools view {input} | awk '($3 != "*") && ($0 ~ /NM:i:/ && match($0, /NM:i:([0-9]+)/, arr) && arr[1] <= 2) {{ split($3, taxon, "|"); print $1, taxon[5], arr[1]; }}' > {output}
+        """
+
+################################################################################
+### Calculate the number of reads assigned to each taxonomic assignment
+rule assign_taxonomy:
+    input:
+        "results/extract/{sample}.tsv"
+    output:
+        "results/taxonomy/{sample}.tsv"
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 10) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 2) * 2 ** (attempt - 1))
+    message:
+        "Assigning taxonomy"
+    script:
+        "scripts/assign_taxonomy.py"
+
+################################################################################
+### Aggregate values to obtain an additive quantiative taxonomic hierarchy
+rule aggregate_taxonomy:
+    input:
+        "results/taxonomy/{sample}.tsv"
+    output:
+        "results/aggregate/{sample}.tsv"
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 10) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 2) * 2 ** (attempt - 1))
+    message:
+        "Assigning taxonomy"
+    script:
+        "scripts/aggregate_taxonomy.py"
+
+################################################################################
+### Merge data from different samples in a final overall dataset
+rule merge_taxonomy:
+    input:
+        expand("results/aggregate/{sample}.tsv",sample=SAMPLE)
+    output:
+        "results/taxonomy_counts.tsv"
+    params:
+        samples=SAMPLE
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(8*1024, int(input.size_mb * 10) * 2 ** (attempt - 1)),
+        runtime=lambda wildcards, input, attempt: max(10, int(input.size_mb / 1024 * 2) * 2 ** (attempt - 1))
+    message:
+        "Assigning taxonomy"
+    script:
+        "scripts/merge_taxonomy.py"
