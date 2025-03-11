@@ -1,6 +1,5 @@
 import pandas as pd
 from collections import defaultdict
-from snakemake import snakemake
 import sys
 
 # Read input and output file paths from Snakemake
